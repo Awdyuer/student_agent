@@ -1,0 +1,9 @@
+需要搭建一个教学ai 云服务系统。在该系统中，已经开发了两个agent，分别基于html的形式服务老师和同学。底层尽量依靠现有的开源组件，管理老师同学登录，基于agent生成课程学习材料（html）形式并进行学习。给出系统的架构和所采用的开源组件。教师登录主要是利用教师agent构建课程内容，课件，查看学生的学习效果等。学生agent主要根据课程的html课件带领学生进行学习并把学习过程和学习效果记录下来供对应老师查看。可以保留一个系统管理员入口进行程序升级以及管理。尽量商用简单可靠的开源组件，尤其支持大模型智能体的编排和管理。
+FastAPI 官方全栈脚手架作为底座，SQLAdmin 提供管理员后台，复用现有两个 Agent 页面，LangGraph + 轻量 Harness 承担智能体运行。
+
+整体采用模块化单体架构：业务模块在同一个项目中，耗时任务单独运行 Worker。先不拆微服务，不引入完整 LMS，也不同时叠加多套 Agent 平台。
+第一阶段直接采用：
+
+FastAPI Full Stack Template + SQLAdmin + PostgreSQL + Celery/RabbitMQ + 现有两个 Agent + 项目内薄 Harness。
+
+其中 LangGraph 按需作为 Harness 的状态编排内核，不强制替换已有 Agent 运行逻辑。
