@@ -42,13 +42,26 @@ export const INTENT = {
 };
 
 /**
+ * 「上课开始」的等价写法。
+ *
+ * 实测中用户把 `/上课开始` 打成了 `/开始上课`——词序颠倒是最常见的输入错误。
+ * 两种都接受。以后遇到别的写法直接往这个表里加，不用改正则。
+ */
+const HOST_START_ALIASES = ["/上课开始", "/开始上课"];
+
+/**
  * 主持人命令前缀。
  *
  * 与 `classroom-chat/public/app.js` 里的 `HOST_COMMANDS` 和
  * `server.mjs` 原来的 `isHostCommand()` 保持同一份定义——
  * 三处各写一份是 n8n 时代的旧账，现在收敛到这里。
  */
-export const HOST_COMMANDS = ["/上课开始", "/开始播放", "/段落结束", "/下课"];
+export const HOST_COMMANDS = [
+  ...HOST_START_ALIASES,
+  "/开始播放",
+  "/段落结束",
+  "/下课",
+];
 
 /** 该消息是否为主持人命令（用于决定回复的语音类型） */
 export function isHostCommand(text) {
@@ -85,7 +98,9 @@ export function classifyMessage(message, context = {}) {
     return { intent: INTENT.UPLOAD, segmentId };
   }
 
-  if (text.startsWith("/上课开始")) return { intent: INTENT.HOST_START, segmentId };
+  if (HOST_START_ALIASES.some((alias) => text.startsWith(alias))) {
+    return { intent: INTENT.HOST_START, segmentId };
+  }
   if (text.startsWith("/开始播放")) return { intent: INTENT.HOST_PLAY, segmentId };
   if (text.startsWith("/段落结束")) return { intent: INTENT.HOST_SEGMENT_END, segmentId };
   if (text.startsWith("/下课")) return { intent: INTENT.HOST_END, segmentId };

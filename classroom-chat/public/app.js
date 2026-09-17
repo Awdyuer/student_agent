@@ -9,7 +9,15 @@ const STORAGE_KEYS = {
   ttsVoice: "teach.classroom.ttsVoice",
 };
 
-const HOST_COMMANDS = ["/上课开始", "/开始播放", "/段落结束", "/下课"];
+// 与 classroom-chat/graph/nodes/classify.mjs 的 HOST_COMMANDS 保持一致。
+// 服务端会返回 speech.kind，这里是离线兜底。
+const HOST_COMMANDS = [
+  "/上课开始",
+  "/开始上课",
+  "/开始播放",
+  "/段落结束",
+  "/下课",
+];
 const TTS_VOICE_LABELS = {
   Cherry: "芊悦 Cherry",
   Serena: "苏瑶 Serena",
