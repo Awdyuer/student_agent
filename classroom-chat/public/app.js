@@ -667,14 +667,14 @@ async function sendMessage(text) {
     };
 
     appendMessage(assistantMessage);
-    setConnectionState("online", "n8n 已连接");
+    setConnectionState("online", "服务已连接");
 
     if (shouldAutoSpeak(assistantMessage, chatInput)) {
       speakMessage(assistantMessage);
     }
   } catch (error) {
     removeTypingIndicator();
-    setConnectionState("offline", "n8n 未连接");
+    setConnectionState("offline", "服务未连接");
     showNotice(error instanceof Error ? error.message : "消息发送失败。", "error");
   } finally {
     setSending(false);
@@ -683,27 +683,27 @@ async function sendMessage(text) {
 }
 
 async function checkConnection() {
-  setConnectionState("checking", "正在连接 n8n");
+  setConnectionState("checking", "正在连接服务");
 
   try {
     const response = await fetch("/api/health", { cache: "no-store" });
     const data = await response.json();
 
     if (!response.ok || !data.connected) {
-      throw new Error(data.error || "n8n 未响应");
+      throw new Error(data.error || "服务未响应");
     }
 
-    setConnectionState("online", "n8n 已连接");
+    setConnectionState("online", "服务已连接");
     elements.webhookDisplay.textContent = data.webhookDisplay || "已配置";
     applyTtsConfig(data.tts);
     hideNotice();
   } catch (error) {
-    setConnectionState("offline", "n8n 未连接");
+    setConnectionState("offline", "服务未连接");
     elements.webhookDisplay.textContent = "后端代理未连通";
     showNotice(
       error instanceof Error
-        ? `${error.message}。请先启动 n8n，再刷新此页面。`
-        : "请先启动 n8n，再刷新此页面。",
+        ? `${error.message}。请检查 classroom-chat/.env 配置后刷新此页面。`
+        : "请检查 classroom-chat/.env 配置后刷新此页面。",
       "error",
     );
   }

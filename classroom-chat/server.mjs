@@ -1,55 +1,32 @@
 import { createServer } from "node:http";
-import { existsSync, readFileSync } from "node:fs";
-import { readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { readFile, stat, writeFile } from "node:fs/promises";
 import { extname, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const SERVER_DIR = fileURLToPath(new URL("./", import.meta.url));
-const ENV_FILE = resolve(SERVER_DIR, ".env");
+import {
+  PATHS,
+  loadLocalEnv,
+  parseKnowledgeBase,
+  readJsonDirectory,
+  readJsonFile,
+} from "./store.mjs";
+import {
+  STAR_STATUS,
+  normalizeMasteryState,
+} from "./mastery-rules.mjs";
+import { isHostCommand } from "./graph/nodes/classify.mjs";
+import { getLlmStatus } from "./graph/llm.mjs";
+import { runTurn } from "./graph/index.mjs";
 
-function loadLocalEnv(filePath, override = false) {
-  if (!existsSync(filePath)) return;
-
-  const content = readFileSync(filePath, "utf8");
-  for (const rawLine of content.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line || line.startsWith("#")) continue;
-
-    const separator = line.indexOf("=");
-    if (separator <= 0) continue;
-
-    const key = line.slice(0, separator).trim();
-    let value = line.slice(separator + 1).trim();
-    if (
-      (value.startsWith('"') && value.endsWith('"')) ||
-      (value.startsWith("'") && value.endsWith("'"))
-    ) {
-      value = value.slice(1, -1);
-    }
-
-    if (value && (override || !process.env[key])) {
-      process.env[key] = value;
-    }
-  }
-}
-
-loadLocalEnv(ENV_FILE);
+loadLocalEnv();
 
 const HOST = process.env.CLASSROOM_CHAT_HOST || "127.0.0.1";
 const PORT = Number(process.env.CLASSROOM_CHAT_PORT || 4173);
-const N8N_CHAT_WEBHOOK =
-  process.env.N8N_CHAT_WEBHOOK ||
-  "http://localhost:5678/webhook/24c2ba65-8779-45a1-86d8-8c6ab4f824eb/chat";
-const N8N_BASE_URL = new URL(N8N_CHAT_WEBHOOK).origin;
 
 const chatPublicDir = resolve(fileURLToPath(new URL("./public/", import.meta.url)));
-const projectDir = resolve(SERVER_DIR, "..");
-const workspaceDir = resolve(projectDir, "student-workspace");
-const workspacePublicDir = resolve(workspaceDir, "public");
-const workspaceDataDir = resolve(workspaceDir, "data");
-const segmentDir = resolve(projectDir, "class-point", "segments");
-const pointDir = resolve(projectDir, "class-point", "points");
-const knowledgeBaseFile = resolve(projectDir, "class agent", "KNOWLEDGE-BASE.md");
+const workspacePublicDir = resolve(PATHS.workspaceDataDir, "..", "public");
+const workspaceDataDir = PATHS.workspaceDataDir;
+const pointDir = PATHS.pointsDir;
 
 const mimeTypes = {
   ".css": "text/css; charset=utf-8",
@@ -59,15 +36,6 @@ const mimeTypes = {
   ".png": "image/png",
   ".svg": "image/svg+xml",
   ".webp": "image/webp",
-};
-
-const STAR_STATUS = {
-  0: "未检测",
-  1: "已标注",
-  2: "初步理解",
-  3: "理解中",
-  4: "接近掌握",
-  5: "已掌握",
 };
 
 const QWEN_VOICES = [
@@ -90,7 +58,7 @@ const ttsAudioCache = new Map();
 const TTS_CACHE_LIMIT = 64;
 
 function getTtsConfig() {
-  loadLocalEnv(ENV_FILE, true);
+  loadLocalEnv(undefined, true);
 
   const provider = process.env.TTS_PROVIDER || "qwen";
   return {
@@ -146,76 +114,15 @@ async function readRequestBody(request) {
   }
 }
 
-function normalizeN8nResponse(payload) {
-  let value = payload;
-  let embeddedSpeechKind = "";
-
-  if (Array.isArray(value)) {
-    value = value[0];
-  }
-
-  if (value?.json && typeof value.json === "object") {
-    value = value.json;
-  }
-
-  if (value?.data && typeof value.data === "object") {
-    value = value.data;
-  }
-
-  let output =
-    value?.output ??
-    value?.text ??
-    value?.message ??
-    value?.reply ??
-    value?.data ??
-    value;
-
-  if (typeof output === "string") {
-    const trimmed = output.trim();
-    if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
-      try {
-        const parsed = JSON.parse(trimmed);
-        embeddedSpeechKind = String(parsed.speechKind || "").trim();
-        output =
-          parsed.text ??
-          parsed.reply ??
-          parsed.output ??
-          parsed.message ??
-          output;
-      } catch {
-        // Keep the original text when it only resembles JSON.
-      }
-    }
-  }
-
-  if (output && typeof output === "object") {
-    output = output.reply ?? output.output ?? output.text ?? output.message ?? JSON.stringify(output);
-  }
-
-  const text = String(output || "").trim();
-  if (!text) {
-    throw new Error("n8n 返回了空消息。");
-  }
-
-  let speech = null;
-  if (value?.speech && typeof value.speech === "object") {
-    speech = value.speech;
-  } else if (value?.speechKind || embeddedSpeechKind) {
-    const kind = String(value?.speechKind || embeddedSpeechKind).trim();
-    speech = {
-      enabled: kind === "teacher_guidance",
-      kind,
-      text,
-    };
-  }
-
-  return {
-    text,
-    speech,
-    raw: value,
-  };
-}
-
+/**
+ * 转发本轮消息到图。
+ *
+ * 替代原先那次 `fetch(N8N_CHAT_WEBHOOK, ...)` 的 HTTP 往返——
+ * 图就跑在本进程里，一次函数调用即可，不再有跨进程边界。
+ *
+ * 返回结构由 graph/output.mjs 的 buildResponse 产生，形态与 n8n 时代一致：
+ *   { text, speech: { enabled, kind, text }, raw }
+ */
 async function forwardChat(request, response) {
   const body = await readRequestBody(request);
   const chatInput = String(body.chatInput || "").trim();
@@ -229,61 +136,15 @@ async function forwardChat(request, response) {
     return sendJson(response, 400, { ok: false, error: "缺少会话 ID。" });
   }
 
-  const upstream = await fetch(N8N_CHAT_WEBHOOK, {
-    method: "POST",
-    headers: {
-      Accept: "application/json",
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      action: "sendMessage",
-      sessionId,
-      chatInput,
-    }),
-    signal: AbortSignal.timeout(120_000),
+  const message = await runTurn({
+    sessionId,
+    chatInput,
+    uploadedFileName: String(body.uploadedFileName || ""),
+    uploadedText: String(body.uploadedText || ""),
+    teacherMaterial: String(body.teacherMaterial || ""),
   });
 
-  const responseText = await upstream.text();
-  let payload;
-
-  try {
-    payload = JSON.parse(responseText);
-  } catch {
-    payload = { output: responseText };
-  }
-
-  if (!upstream.ok) {
-    const detail =
-      payload?.message ||
-      payload?.error?.message ||
-      payload?.error ||
-      responseText ||
-      upstream.statusText;
-    return sendJson(response, upstream.status, {
-      ok: false,
-      error: `n8n 返回 HTTP ${upstream.status}：${String(detail).slice(0, 500)}`,
-    });
-  }
-
-  const normalized = normalizeN8nResponse(payload);
-
-  if (isHostCommand(chatInput) && !normalized.speech) {
-    normalized.speech = {
-      enabled: true,
-      kind: "teacher_guidance",
-      text: normalized.text,
-    };
-  }
-
-  return sendJson(response, 200, {
-    ok: true,
-    message: normalized,
-  });
-}
-
-function isHostCommand(text) {
-  const commands = ["/上课开始", "/开始播放", "/段落结束", "/下课"];
-  return commands.some((command) => text.startsWith(command));
+  return sendJson(response, 200, { ok: true, message });
 }
 
 function readCachedAudio(key) {
@@ -423,153 +284,54 @@ async function synthesizeSpeech(request, response) {
   response.end(audio.buffer);
 }
 
+/**
+ * 健康检查。
+ *
+ * 原来探的是 n8n 的 `/healthz`；现在图跑在本进程里，没有外部依赖可探，
+ * 改为报告模型配置状态。
+ *
+ * 响应字段保持与前端一致——app.js:689-703 读 connected / error /
+ * webhookDisplay / tts。其中 webhookDisplay 现在显示模型名
+ * （前端设置面板里那一栏原先是"n8n 地址"）。
+ */
 async function checkHealth(response) {
-  try {
-    const health = await fetch(`${N8N_BASE_URL}/healthz`, {
-      headers: { Accept: "application/json" },
-      signal: AbortSignal.timeout(3_000),
-    });
+  const llm = getLlmStatus();
+  const display = `${llm.provider} / ${llm.model}`;
 
-    if (!health.ok) {
-      throw new Error(`HTTP ${health.status}`);
-    }
-
-    return sendJson(response, 200, {
-      ok: true,
-      connected: true,
-      webhookDisplay: N8N_CHAT_WEBHOOK,
-      tts: getTtsStatus(),
-    });
-  } catch (error) {
+  if (!llm.configured) {
     return sendJson(response, 503, {
       ok: false,
       connected: false,
-      webhookDisplay: N8N_CHAT_WEBHOOK,
+      webhookDisplay: display,
       tts: getTtsStatus(),
-      error: error instanceof Error ? error.message : "n8n 未响应",
+      llm,
+      error: "DeepSeek 未配置，请在 classroom-chat/.env 中填写 DEEPSEEK_API_KEY。",
     });
   }
+
+  return sendJson(response, 200, {
+    ok: true,
+    connected: true,
+    webhookDisplay: display,
+    tts: getTtsStatus(),
+    llm,
+  });
 }
 
-async function readJsonFile(filePath, fallback) {
-  try {
-    return JSON.parse(await readFile(filePath, "utf8"));
-  } catch {
-    return fallback;
-  }
-}
-
-async function readJsonDirectory(directory) {
-  try {
-    const files = await readdir(directory);
-    const records = [];
-
-    for (const fileName of files) {
-      if (!fileName.toLowerCase().endsWith(".json")) continue;
-      const record = await readJsonFile(resolve(directory, fileName), null);
-      if (record) records.push(record);
-    }
-
-    return records;
-  } catch {
-    return [];
-  }
-}
-
-function parseKnowledgeBase(markdown) {
-  const blocks = String(markdown || "").split(/^## /m).slice(1);
-  const knowledgePoints = [];
-
-  for (const block of blocks) {
-    const [heading = "", ...lines] = block.split(/\r?\n/);
-    const headingMatch = heading.trim().match(/^(KP-\d+)\s+(.+)$/);
-    if (!headingMatch) continue;
-
-    const item = {
-      kp_id: headingMatch[1],
-      title: headingMatch[2].trim(),
-      definition: "",
-      detection_question: "",
-      mastery_criteria: "",
-      order_index: knowledgePoints.length + 1,
-    };
-
-    for (const line of lines) {
-      const fieldMatch = line.match(/^-\s*(定义|检测问题|掌握表现):\s*(.+)$/);
-      if (!fieldMatch) continue;
-
-      if (fieldMatch[1] === "定义") item.definition = fieldMatch[2].trim();
-      if (fieldMatch[1] === "检测问题") item.detection_question = fieldMatch[2].trim();
-      if (fieldMatch[1] === "掌握表现") item.mastery_criteria = fieldMatch[2].trim();
-    }
-
-    knowledgePoints.push(item);
-  }
-
-  return knowledgePoints;
-}
-
-function legacyStatusToStars(status) {
-  if (status === "掌握") return 4;
-  if (status === "部分掌握") return 3;
-  if (status === "未掌握") return 1;
-  return 0;
-}
-
-function normalizeMasteryState(rawState, knowledgePoints) {
-  const source =
-    rawState && typeof rawState === "object" && rawState.knowledge_points
-      ? rawState.knowledge_points
-      : rawState || {};
-
-  const states = {};
-  for (const knowledgePoint of knowledgePoints) {
-    const raw = source[knowledgePoint.kp_id];
-    if (typeof raw === "string") {
-      const stars = legacyStatusToStars(raw);
-      states[knowledgePoint.kp_id] = {
-        kp_id: knowledgePoint.kp_id,
-        stars,
-        status: STAR_STATUS[stars],
-        assessment_status: stars === 5 ? "已通过" : "未考核",
-        annotation_ids: [],
-        last_annotation_id: null,
-        last_source: "manual",
-        last_evidence: `从旧状态“${raw}”迁移。`,
-        updated_at: null,
-      };
-      continue;
-    }
-
-    const stars = Math.max(0, Math.min(5, Number(raw?.stars) || 0));
-    states[knowledgePoint.kp_id] = {
-      kp_id: knowledgePoint.kp_id,
-      stars,
-      status: raw?.status || STAR_STATUS[stars],
-      assessment_status: raw?.assessment_status || (stars === 5 ? "已通过" : "未考核"),
-      annotation_ids: Array.isArray(raw?.annotation_ids) ? raw.annotation_ids : [],
-      last_annotation_id: raw?.last_annotation_id || null,
-      last_source: raw?.last_source || "knowledge_base",
-      last_evidence: raw?.last_evidence || "",
-      updated_at: raw?.updated_at || null,
-    };
-  }
-
-  return {
-    version: 2,
-    student_id: rawState?.student_id || "student-001",
-    updated_at: rawState?.updated_at || null,
-    knowledge_points: states,
-  };
-}
+// readJsonFile / readJsonDirectory / parseKnowledgeBase 已移到 ./store.mjs，
+// legacyStatusToStars / normalizeMasteryState 已移到 ./mastery-rules.mjs。
+// 图和服务器共用同一份实现——两套实现各自漂移正是 n8n 时代的旧账。
 
 async function loadWorkspaceBootstrap() {
-  const knowledgeBaseMarkdown = await readFile(knowledgeBaseFile, "utf8");
+  // 这里刻意用会抛错的 readFile 而不是 store.mjs 里的容错版本：
+  // KNOWLEDGE-BASE.md 是掌握表的全集来源，缺失时应当明确报错，
+  // 而不是静默返回空知识点列表（那会让掌握表看起来"全清空了"）。
+  const knowledgeBaseMarkdown = await readFile(PATHS.knowledgeBaseFile, "utf8");
   const knowledgePoints = parseKnowledgeBase(knowledgeBaseMarkdown);
   const knowledgePointMap = new Map(
     knowledgePoints.map((knowledgePoint) => [knowledgePoint.kp_id, knowledgePoint]),
   );
-  const segments = (await readJsonDirectory(segmentDir)).sort(
+  const segments = (await readJsonDirectory(PATHS.segmentsDir)).sort(
     (left, right) => Number(left.order || 0) - Number(right.order || 0),
   );
   const rawPoints = await readJsonDirectory(pointDir);
@@ -876,7 +638,10 @@ const server = createServer(async (request, response) => {
   } catch (error) {
     console.error("[classroom-chat]", error);
     if (!response.headersSent) {
-      const status = error?.code === "TTS_NOT_CONFIGURED" ? 503 : 500;
+      const status =
+        error?.code === "TTS_NOT_CONFIGURED" || error?.code === "LLM_NOT_CONFIGURED"
+          ? 503
+          : 500;
       sendJson(response, status, {
         ok: false,
         code: error?.code,
@@ -888,8 +653,11 @@ const server = createServer(async (request, response) => {
 });
 
 server.listen(PORT, HOST, () => {
+  const llm = getLlmStatus();
   console.log(`课堂对话页面：http://${HOST}:${PORT}`);
   console.log(`学生 workspace：http://${HOST}:${PORT}/student/`);
-  console.log(`n8n Webhook：${N8N_CHAT_WEBHOOK}`);
+  console.log(
+    `模型：${llm.model}（${llm.configured ? "已配置" : "未配置 DEEPSEEK_API_KEY"}）`,
+  );
   console.log(`高级语音：${getTtsStatus().configured ? "已配置" : "未配置"}`);
 });
